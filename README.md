@@ -1,10 +1,24 @@
-# ReFPO: Reflow Regularization for Flow Matching Policy Gradients
+<h1 align="center">ReFPO</h1>
+<p align="center"><strong>Reflow Regularization for Flow Matching Policy Gradients</strong></p>
 
-[Paper (NeurIPS 2026)](https://openreview.net/forum?id=QGCmtNLIKF)
+<p align="center">
+  Ge Wang, Yibo Peng, Fan Feng, Shenhao Yan, Chengsi Yao, Jiahao Yang, Honghao Cai,<br>
+  Yiming Zhao, Xi Li, Jinke Ren, Shuguang Cui, Yatong Han, and Zhen Li
+</p>
 
-Ge Wang, Yibo Peng, Fan Feng, Shenhao Yan, Chengsi Yao, Jiahao Yang, Honghao Cai, Yiming Zhao, Xi Li, Jinke Ren, Shuguang Cui, Yatong Han, and Zhen Li
+<p align="center">
+  <a href="https://openreview.net/forum?id=QGCmtNLIKF">Paper on OpenReview</a> ·
+  <a href="#training-and-evaluation">Training and evaluation</a> ·
+  <a href="#citation">BibTeX</a>
+</p>
 
-ReFPO adds an advantage-independent flow-matching loss to Flow Policy Optimization (FPO). It reuses the policy update's sampled actions, noise, and times. A trained policy can then be evaluated with a single Euler step. Our implementation builds directly on the [FPO codebase](https://github.com/akanazawa/fpo).
+> 🎉 Our paper was accepted for a poster presentation at **NeurIPS 2026**!
+
+<p align="center">
+  <img src="assets/refpo-overview.png" width="780" alt="Flow trajectories illustrating signed local CFM updates in FPO and Reflow regularization for one-step control in ReFPO.">
+</p>
+
+ReFPO adds an advantage-independent flow-matching loss to FPO. It reuses the actions, noise, and times sampled during training, so the regularizer needs no extra model forward pass. At inference, the policy can generate an action in a single Euler step.
 
 ## Training and evaluation
 
