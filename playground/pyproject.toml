@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flow_policy"
+version = "0.0.0"
+description = "ReFPO and FPO for MuJoCo Playground"
+readme = "README.md"
+license = { file="LICENSE" }
+requires-python = ">=3.12,<3.13"
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent"
+]
+dependencies = [
+    "jax==0.6.2",
+    "mujoco==3.3.3",
+    "mujoco-mjx==3.3.3",
+    "flax==0.10.6",
+    "optax==0.2.5",
+    "playground==0.0.5",
+    "matplotlib==3.9.2",
+    "jax_dataclasses==1.6.3",
+    "wandb==0.21.0",
+    "tyro==0.9.26",
+]
+

@@ -1,0 +1,343 @@
+--- a/phc/pyproject.toml
++++ b/phc/pyproject.toml
+@@ -14,6 +14,12 @@
+     "chumpy@git+https://github.com/nico-von-huene/chumpy.git",
+     "carbs@git+https://github.com/PufferAI/carbs.git",    
+ ]
++
++[tool.setuptools.packages.find]
++include = ["puffer_phc*"]
++
++[tool.setuptools.package-data]
++puffer_phc = ["*.pyx", "assets/*"]
+ 
+ [tool.pixi.project]
+ channels = ["pytorch", "nvidia", "conda-forge"]
+@@ -47,6 +53,9 @@
+ fsspec = ">=2024.10.0,<2025"
+ 
+ [tool.pixi.pypi-dependencies]
++puffer-phc = { path = ".", editable = true }
++torchdiffeq = ">=0.2.5,<0.3"
++rich-argparse = ">=1.5,<2"
+ pufferlib = { git = "https://github.com/kywch/PufferLib.git", branch = "isaacgym" }
+ 
+ [tool.pixi.activation]
+--- a/phc/puffer_phc/humanoid_phc.py
++++ b/phc/puffer_phc/humanoid_phc.py
+@@ -5,10 +5,7 @@
+ 
+ from isaacgym import gymapi
+ 
+-try:
+-    import gymtorch
+-except ImportError:
+-    from isaacgym import gymtorch
++from isaacgym import gymtorch
+ 
+ from gym import spaces
+ import torch
+--- a/phc/puffer_phc/policy.py
++++ b/phc/puffer_phc/policy.py
+@@ -590,13 +590,11 @@
+                 x1 = self.path.velocity_to_target(x_t=x_t, velocity=velocity, t=t.unsqueeze(-1).unsqueeze(-1))
+                 # loss  
+                 log_probs = -((u_t - velocity) ** 2) / (2 * 0.05 ** 2)
+-                loss = - log_probs.reshape(-1).mean()
+-                # loss = torch.pow(velocity - u_t, 2).mean(-1)
++                loss = (velocity - u_t).square().mean()
+             elif self.parameterization == "data":
+                 x1 = self.mu(hidden)
+                 log_probs = -((x1 - actions) ** 2) / (2 * 0.05 ** 2)
+-                loss = - log_probs.reshape(-1).mean()
+-                # loss = torch.pow(x1 - actions, 2).mean(-1)
++                loss = (x1 - actions).square().mean()
+ 
+         # (TODO) Mean bound loss
+         if self.training:
+--- a/phc/puffer_phc/clean_pufferl.py
++++ b/phc/puffer_phc/clean_pufferl.py
+@@ -23,7 +23,7 @@
+ 
+ # For the fast Cython GAE implementation
+ pyximport.install(setup_args={"include_dirs": np.get_include()})
+-from c_gae import compute_gae  # noqa
++from .c_gae import compute_gae  # noqa
+ 
+ torch.set_float32_matmul_precision("high")
+ 
+@@ -284,7 +284,7 @@
+             with profile.train_forward:
+ 
+                 if getattr(config, "flow_matching", False):
+-                    newlogprob, _, newvalue = data.policy.policy.flow_matching_loss(atn, obs, noise=b_noise[mb], t=b_t[mb], sample_mask=sample_mask)
++                    newlogprob, raw_cfm, newvalue = data.policy.policy.flow_matching_loss(atn, obs, noise=b_noise[mb], t=b_t[mb], sample_mask=sample_mask)
+                     entropy = torch.zeros_like(atn[:, 0])
+ 
+                 else:
+@@ -371,6 +371,8 @@
+ 
+                 entropy_loss = entropy.mean()
+                 loss = pg_loss - config.ent_coef * entropy_loss + v_loss * config.vf_coef
++                if getattr(config, "flow_matching", False):
++                    loss = loss + config.reflow_coeff * raw_cfm
+ 
+                 # Discriminator loss
+                 disc_loss = 0.0
+@@ -845,7 +847,7 @@
+     if os.path.exists(model_path):
+         return model_path
+ 
+-    checkpoint = {"config": data.config, "state_dict": data.uncompiled_policy.state_dict()}
++    checkpoint = {"config": data.config, "env_steps": data.global_step, "state_dict": data.uncompiled_policy.state_dict()}
+     torch.save(checkpoint, model_path)
+ 
+     state = {
+--- a/phc/puffer_phc/environment.py
++++ b/phc/puffer_phc/environment.py
+@@ -2,8 +2,6 @@
+ import argparse
+ import functools
+ from puffer_phc.humanoid_phc import HumanoidPHC
+-from puffer_phc.render_env import HumanoidRenderEnv
+-from puffer_phc.render_env_viser import HumanoidRenderEnvViser
+ import torch
+ import numpy as np
+ from typing import Literal
+@@ -61,8 +59,10 @@
+         if visualization == "none":
+             self.env = HumanoidPHC(cfg, device_type=device_type, device_id=device_id, headless=True)
+         elif visualization == "isaac":
++            from puffer_phc.render_env import HumanoidRenderEnv
+             self.env = HumanoidRenderEnv(cfg, device_type=device_type, device_id=device_id, headless=False)
+         elif visualization == "viser":
++            from puffer_phc.render_env_viser import HumanoidRenderEnvViser
+             self.env = HumanoidRenderEnvViser(cfg, device_type=device_type, device_id=device_id, visualize_non_overlap=viser_visualize_non_overlap)
+ 
+         self.single_observation_space = self.env.single_observation_space
+--- a/phc/scripts/train.py
++++ b/phc/scripts/train.py
+@@ -1,4 +1,5 @@
+ import os
++from pathlib import Path
+ import gc
+ import ast
+ import sys
+@@ -137,7 +138,7 @@
+             self.pbar.refresh()
+             self.mpjpe, self.gt_pos, self.pred_pos = [], [], []
+ 
+-        update_str = f"Terminated: {self.terminate_state.sum().item()} | max frames: {curr_max} | steps {self.curr_steps} | Start: {self.task_env.motion_sample_start_idx} | Succ rate: {self.success_rate:.3f} | Mpjpe: {np.mean(self.mpjpe_all) * 1000:.3f}"
++        update_str = f"Terminated: {self.terminate_state.sum().item()} | max frames: {curr_max} | steps {self.curr_steps} | Start: {self.task_env.motion_sample_start_idx} | Succ rate: {self.success_rate:.3f} | Mpjpe: {(float(self.mpjpe[-1].mean()) * 1000 if self.mpjpe else 0.0):.3f}"
+         self.pbar.set_description(update_str)
+ 
+         return False, next_batch
+@@ -157,19 +158,20 @@
+         # success_keys = self.task_env.motion_data_keys[~terminate_hist[:self.num_unique_motions]]
+ 
+         metrics_all = compute_metrics_lite(pred_pos_all, gt_pos_all)
+-        metrics_succ = compute_metrics_lite(pred_pos_all_succ, gt_pos_all_succ)
++        metrics_succ = compute_metrics_lite(pred_pos_all_succ, gt_pos_all_succ) if succ_idxes else {}
+ 
+         metrics_all_print = {m: float(np.mean(v)) for m, v in metrics_all.items()}
+         metrics_succ_print = {m: float(np.mean(v)) for m, v in metrics_succ.items()}
+ 
+         if len(metrics_succ_print) == 0:
+             print("No success!!!")
+-            metrics_succ_print = metrics_all_print
++            metrics_succ_print = dict.fromkeys(metrics_all_print)
+ 
+         print("------------------------------------------")
+         print(f"Success Rate: {self.success_rate:.10f}")
+         print("All: ", " \t".join([f"{k}: {v:.3f}" for k, v in metrics_all_print.items()]))
+-        print("Succ: ", " \t".join([f"{k}: {v:.3f}" for k, v in metrics_succ_print.items()]))
++        if succ_idxes:
++            print("Succ: ", " \t".join([f"{k}: {v:.3f}" for k, v in metrics_succ_print.items()]))
+         print("Failed keys: ", len(self.failed_keys), ",", self.failed_keys)
+ 
+         self.results = {
+@@ -597,10 +599,11 @@
+     parser.add_argument("--config", default="config.ini")
+     parser.add_argument("--mode", type=str, default="train", choices="train eval play sweep".split())
+     parser.add_argument(
+-        "-m", "--motion-file", type=str, default="sample_data/cmu_mocap_05_06.pkl", help="Path to motion file"
++        "-m", "--motion-file", type=str, default=None, help="Path to motion file"
+     )
+     parser.add_argument("-c", "--checkpoint-path", type=str, default=None, help="Path to a pretrained checkpoint")
+     # default="ckpt_amass_800m_acc97.pt")
++    parser.add_argument("--eval-output", help="New JSON file for a checkpoint evaluation")
+     parser.add_argument("--track", action="store_true", help="Track on WandB")
+     parser.add_argument("--wandb-project", type=str, default="pufferlib")
+     parser.add_argument("--ssc-lr", type=float, default=0.0001, help="Sweep search center for learning rate")
+@@ -610,7 +613,8 @@
+     args = parser.parse_known_args()[0]
+ 
+     p = configparser.ConfigParser()
+-    p.read(args.config)
++    if not p.read(args.config):
++        parser.error(f"Missing config file: {args.config}")
+ 
+     for section in p.sections():
+         for key in p[section]:
+@@ -640,6 +644,17 @@
+             prev[subkey] = value
+ 
+     device = args["train"]["device"]
++    if args["mode"] == "eval" and not (args["checkpoint_path"] and args["eval_output"]):
++        parser.error("Evaluation requires --checkpoint-path and --eval-output")
++    if args["mode"] == "eval" and Path(args["eval_output"]).exists():
++        parser.error("Use a new --eval-output file")
++    clean_pufferl.seed_everything(args["train"]["seed"], args["train"]["torch_deterministic"])
++    args["train"]["reflow_coeff"] = float(args["train"].get("reflow_coeff", 0.0))
++    if not math.isfinite(args["train"]["reflow_coeff"]) or args["train"]["reflow_coeff"] < 0:
++        parser.error("Use a finite nonnegative Reflow coefficient")
++    args["train"]["conditioning"] = ("root+hands" if args["policy"].get("hand_track")
++                                     else "root" if args["policy"].get("root_track") else "all joints")
++    args["train"]["parameterization"] = args["policy"].get("parameterization")
+ 
+     # Create the environment
+     args["env"]["name"] = args["env_name"]
+@@ -672,12 +687,17 @@
+ 
+     if args["checkpoint_path"]:
+         checkpoint = torch.load(args["checkpoint_path"], map_location=device)
++        saved = checkpoint["config"]
++        for field in ("conditioning", "parameterization"):
++            value = getattr(saved, field, None)
++            if value is not None and value != args["train"][field]:
++                parser.error(f"Checkpoint {field} is {value}. Check --config.")
+         policy.load_state_dict(checkpoint["state_dict"])
+         print(f"Loaded checkpoint from {args['checkpoint_path']}")
+ 
+     # Train or evaluate
+     if args["mode"] == "train":
+-        train(args, vec_env, policy)
++        train(args, vec_env, policy, skip_resample=args["skip_resample"], final_eval=args["final_eval"])
+ 
+     elif args["mode"] == "play":
+         # Just to play and render without collecting stats
+@@ -685,15 +705,22 @@
+         rollout(vec_env, policy)
+ 
+     elif args["mode"] == "eval":
+-        import polars as pl
+ 
+         eval_stats = EvalStats(vec_env)
+         rollout(vec_env, policy, eval_stats)
+ 
+-        with open(f"eval_summary_{datetime.now().strftime('%m%d_%H%M')}.json", "w") as f:
+-            json.dump(eval_stats.results, f, indent=4)
+-
+-        df = pl.DataFrame(eval_stats.results_by_motion)
+-        df.write_csv(f"results_by_motion_{datetime.now().strftime('%m%d_%H%M')}.tsv", separator="\t")
++        output = Path(args["eval_output"])
++        output.parent.mkdir(parents=True, exist_ok=True)
++        result = dict(eval_stats.results)
++        result.update(checkpoint=str(args["checkpoint_path"]), train_seed=getattr(saved, "seed", None),
++                      eval_seed=args["train"]["seed"], env_steps=checkpoint.get("env_steps"),
++                      conditioning=args["train"]["conditioning"], parameterization=args["train"]["parameterization"],
++                      reflow_coeff=getattr(saved, "reflow_coeff", None),
++                      step_size=args["policy"]["solver_step_size"], motions=eval_stats.num_unique_motions,
++                      motion_file=str(args["env"]["motion_file"]),
++                      alive_steps=float(np.mean(eval_stats.results_by_motion["played_steps"])))
++        with output.open("x") as handle:
++            handle.write(json.dumps(result, indent=2, allow_nan=False) + "\n")
++        print(output)
+ 
+         eval_stats.update_env_and_close()
+--- a/phc/configs/fpo.ini
++++ b/phc/configs/fpo.ini
+@@ -10,7 +10,7 @@
+ 
+ [policy]
+ hidden_size = 512
+-parameterization = data
++parameterization = velocity
+ solver_step_size = 0.1
+ perturb_action_std = 0.05
+ condition_drop_ratio = 0
+@@ -35,6 +35,7 @@
+ kd_scale = 1.0
+ 
+ [train]
++reflow_coeff = 0.1
+ seed = 1
+ torch_deterministic = True
+ device = cuda
+@@ -45,7 +46,7 @@
+ norm_adv = True
+ target_kl = None
+ 
+-total_timesteps = 1_310_000_000
++total_timesteps = 100_000_000
+ eval_timesteps = 1_310_000
+ 
+ data_dir = experiments
+--- a/phc/configs/fpo_hand.ini
++++ b/phc/configs/fpo_hand.ini
+@@ -10,7 +10,7 @@
+ 
+ [policy]
+ hidden_size = 512
+-parameterization = data
++parameterization = velocity
+ solver_step_size = 0.1
+ perturb_action_std = 0.05
+ condition_drop_ratio = 1.0
+@@ -36,6 +36,7 @@
+ kd_scale = 1.0
+ 
+ [train]
++reflow_coeff = 0.1
+ seed = 1
+ torch_deterministic = True
+ device = cuda
+@@ -46,7 +47,7 @@
+ norm_adv = True
+ target_kl = None
+ 
+-total_timesteps = 1_310_000_000
++total_timesteps = 100_000_000
+ eval_timesteps = 1_310_000
+ 
+ data_dir = experiments
+--- a/phc/configs/fpo_root.ini
++++ b/phc/configs/fpo_root.ini
+@@ -10,7 +10,7 @@
+ 
+ [policy]
+ hidden_size = 512
+-parameterization = data
++parameterization = velocity
+ solver_step_size = 0.1
+ perturb_action_std = 0.05
+ condition_drop_ratio = 1.0
+@@ -36,6 +36,7 @@
+ kd_scale = 1.0
+ 
+ [train]
++reflow_coeff = 0.1
+ seed = 1
+ torch_deterministic = True
+ device = cuda
+@@ -46,7 +47,7 @@
+ norm_adv = True
+ target_kl = None
+ 
+-total_timesteps = 1_310_000_000
++total_timesteps = 100_000_000
+ eval_timesteps = 1_310_000
+ 
+ data_dir = experiments
+--- a/phc/env_setup.sh
++++ b/phc/env_setup.sh
+@@ -1,7 +1,2 @@
+ #!/bin/bash
+-
+-export LD_LIBRARY_PATH="$PIXI_PROJECT_ROOT/.pixi/envs/default/lib"
+-
+-# Necessary for capturing video (resolve vulkan:No DRI3 support)
+-# https://github.com/isaac-sim/IsaacGymEnvs/issues/126
+-export MESA_VK_DEVICE_SELECT="10de:2204"
+\ No newline at end of file
++export LD_LIBRARY_PATH="${CONDA_PREFIX:-$PIXI_PROJECT_ROOT/.pixi/envs/default}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
